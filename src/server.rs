@@ -23,7 +23,7 @@ impl HashLoader for MyHashLoader {
         println!("Got a request: {:?}", request);
 
         let response = LoadResponse {
-            message: format!("Hello {}!", request.into_inner().name).into(),
+            message: format!("Hello {}!", request.into_inner().name),
         };
 
         Ok(Response::new(response))
@@ -32,9 +32,6 @@ impl HashLoader for MyHashLoader {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // let mut menu = Menu::new();
-    let quit_item = MenuItem::new("Quit", true, None);
-
     let icon_path = concat!(env!("CARGO_MANIFEST_DIR"), "/icon.png");
     let icon = {
         let image = image::open(Path::new(icon_path))
@@ -45,17 +42,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tray_icon::Icon::from_rgba(rgba, width, height).expect("Failed to create icon")
     };
 
-    let menu = Menu::new();
-    menu.append(&quit_item).unwrap();
-    let tray_icon = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_tooltip("system-tray - tray icon library!")
-        .with_icon(icon)
-        .build()
-        .unwrap();
-
-    let receiver = TrayIconEvent::receiver();
     std::thread::spawn(move || {
+        let menu = Menu::new();
+        menu.append(&MenuItem::new("Quit", true, None)).unwrap();
+
+        #[cfg(target_os = "linux")]
+        gtk::init().unwrap();
+
+        let tray_icon = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("system-tray - tray icon library!")
+            .with_icon(icon)
+            .build()
+            .unwrap();
+
+        #[cfg(target_os = "linux")]
+        gtk::main();
+    });
+
+    std::thread::spawn(move || {
+        println!("listening...");
+        let receiver = MenuEvent::receiver();
         loop {
             match receiver.recv() {
                 Ok(event) => {
