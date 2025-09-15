@@ -1,0 +1,14 @@
+syntax = "proto3";
+package hashservice;
+
+service HashLoader {
+    rpc Load (LoadRequest) returns (LoadResponse);
+}
+
+message LoadRequest {
+    string name = 1;
+}
+
+message LoadResponse {
+    string message = 1;
+}

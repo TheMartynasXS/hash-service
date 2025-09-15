@@ -1,0 +1,22 @@
+[package]
+name = "hash-service"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "ltk-hash-server"
+path = "src/server.rs"
+
+[[bin]]
+name = "ltk-hash-client"
+path = "src/client.rs"
+
+[dependencies]
+tonic = "*"
+prost = "0.14"
+tonic-prost = "*"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tray-icon = "0.21.1"
+
+[build-dependencies]
+tonic-prost-build = "*"
