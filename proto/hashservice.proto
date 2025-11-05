@@ -2,13 +2,48 @@ syntax = "proto3";
 package hashservice;
 
 service HashLoader {
-    rpc Load (LoadRequest) returns (LoadResponse);
+    rpc LoadHashes (LoadHashesRequest) returns (LoadHashesResponse);
+    rpc GetString (GetStringRequest) returns (GetStringResponse);
+    rpc UnloadHashes (UnloadHashesRequest) returns (UnloadHashesResponse);
+    rpc AddHash (AddHashRequest) returns (AddHashResponse);
 }
 
-message LoadRequest {
-    string name = 1;
+message LoadHashesRequest {
+    // Empty message for now
 }
 
-message LoadResponse {
-    string message = 1;
+message LoadHashesResponse {
+    bool success = 1;
+    string message = 2;
+    int32 count = 3;
+}
+
+message GetStringRequest {
+    uint64 hash = 1;
+    string hashtable_type = 2; // "game" or "bin"
+}
+
+message GetStringResponse {
+    bool found = 1;
+    string value = 2;
+}
+
+message UnloadHashesRequest {
+    // Empty message for now
+}
+
+message UnloadHashesResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message AddHashRequest {
+    uint64 hash = 1;
+    string value = 2;
+    string hashtable_type = 3; // "game" or "bin"
+}
+
+message AddHashResponse {
+    bool success = 1;
+    string message = 2;
 }
