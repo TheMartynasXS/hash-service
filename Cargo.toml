@@ -6,6 +6,7 @@ edition = "2024"
 [[bin]]
 name = "ltk-hash-service"
 path = "src/server.rs"
+windows_subsystem = "windows"
 
 
 [dependencies]

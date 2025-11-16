@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"]
 use tonic::transport::Server;
 
 mod state;
