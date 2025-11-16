@@ -38,9 +38,8 @@ message UnloadHashesResponse {
 }
 
 message AddHashRequest {
-    uint64 hash = 1;
-    string value = 2;
-    string hashtable_type = 3; // "game" or "bin"
+    string string = 1;
+    string hashtable_type = 2; // "game" or "bin"
 }
 
 message AddHashResponse {

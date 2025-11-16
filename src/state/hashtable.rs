@@ -12,15 +12,29 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tonic::{Request, Response, Status};
 use walkdir::WalkDir;
+use xxhash_rust::xxh64::xxh64;
 
 pub mod hash_service {
     tonic::include_proto!("hashservice");
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ServiceHashLoader {
     game_hashes: Arc<RwLock<HashMap<u64, String>>>,
     bin_hashes: Arc<RwLock<HashMap<u64, String>>>,
+    loading_state: Arc<RwLock<LoadingState>>,
+}
+
+enum HashtableType {
+    Game,
+    Bin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadingState {
+    Unloaded,
+    Loading,
+    Loaded,
 }
 
 #[tonic::async_trait]
@@ -31,40 +45,47 @@ impl HashLoader for ServiceHashLoader {
     ) -> Result<Response<LoadHashesResponse>, Status> {
         println!("load_hashes called: {:?}", request);
 
-        // Sync and load hashtables
-        match self.load_hashes_impl().await {
+        // Set state to Loading
+        {
+            let mut state_guard = self
+                .loading_state
+                .write()
+                .map_err(|_| Status::internal("Failed to lock loading state"))?;
+            *state_guard = LoadingState::Loading;
+        }
+
+        let result = self.load_hashes_impl().await;
+
+        // Update state based on result
+        {
+            let mut state_guard = self
+                .loading_state
+                .write()
+                .map_err(|_| Status::internal("Failed to lock loading state"))?;
+            *state_guard = if result.is_ok() {
+                LoadingState::Loaded
+            } else {
+                LoadingState::Unloaded
+            };
+        }
+
+        match result {
             Ok(()) => {
-                // Get the total count of loaded hashes
-                let game_guard = self
-                    .game_hashes
-                    .read()
-                    .map_err(|_| Status::internal("Failed to lock game hashtable"))?;
-                let bin_guard = self
-                    .bin_hashes
-                    .read()
-                    .map_err(|_| Status::internal("Failed to lock bin hashtable"))?;
-
-                let total_count = (game_guard.len() + bin_guard.len()) as i32;
-
-                let response = LoadHashesResponse {
+                let (game_count, bin_count) = self.get_counts()?;
+                Ok(Response::new(LoadHashesResponse {
                     success: true,
                     message: format!(
                         "Hashtables loaded: {} game, {} bin hashes!",
-                        game_guard.len(),
-                        bin_guard.len()
+                        game_count, bin_count
                     ),
-                    count: total_count,
-                };
-                Ok(Response::new(response))
+                    count: (game_count + bin_count) as i32,
+                }))
             }
-            Err(e) => {
-                let response = LoadHashesResponse {
-                    success: false,
-                    message: format!("Failed to load hashtables: {}", e),
-                    count: 0,
-                };
-                Ok(Response::new(response))
-            }
+            Err(e) => Ok(Response::new(LoadHashesResponse {
+                success: false,
+                message: format!("Failed to load hashtables: {}", e),
+                count: 0,
+            })),
         }
     }
 
@@ -78,9 +99,11 @@ impl HashLoader for ServiceHashLoader {
             req.hash, req.hashtable_type
         );
 
-        let hashtable = match req.hashtable_type.as_str() {
-            "game" => &self.game_hashes,
-            "bin" => &self.bin_hashes,
+        self.ensure_loaded_status().await?;
+
+        let hashtable_type = match req.hashtable_type.as_str() {
+            "game" => HashtableType::Game,
+            "bin" => HashtableType::Bin,
             _ => {
                 return Ok(Response::new(GetStringResponse {
                     found: false,
@@ -89,20 +112,21 @@ impl HashLoader for ServiceHashLoader {
             }
         };
 
-        let hashtable_guard = hashtable
+        let hashtable = self.get_hashtable(&hashtable_type);
+        let guard = hashtable
             .read()
             .map_err(|_| Status::internal("Failed to lock hashtable"))?;
 
-        let response = match hashtable_guard.get(&req.hash) {
-            Some(value) => GetStringResponse {
+        let response = guard
+            .get(&req.hash)
+            .map(|value| GetStringResponse {
                 found: true,
                 value: value.clone(),
-            },
-            None => GetStringResponse {
+            })
+            .unwrap_or_else(|| GetStringResponse {
                 found: false,
                 value: String::new(),
-            },
-        };
+            });
 
         Ok(Response::new(response))
     }
@@ -113,12 +137,43 @@ impl HashLoader for ServiceHashLoader {
     ) -> Result<Response<UnloadHashesResponse>, Status> {
         println!("unload_hashes called");
 
-        // Placeholder implementation
-        let response = UnloadHashesResponse {
+        // Clear the hashtables to free memory
+        {
+            let mut game_guard = self
+                .game_hashes
+                .write()
+                .map_err(|_| Status::internal("Failed to lock game hashtable"))?;
+            let mut bin_guard = self
+                .bin_hashes
+                .write()
+                .map_err(|_| Status::internal("Failed to lock bin hashtable"))?;
+
+            let game_count = game_guard.len();
+            let bin_count = bin_guard.len();
+
+            game_guard.clear();
+            bin_guard.clear();
+
+            // Shrink capacity to minimize memory usage
+            game_guard.shrink_to_fit();
+            bin_guard.shrink_to_fit();
+
+            println!("Unloaded {} game and {} bin hashes", game_count, bin_count);
+        }
+
+        // Update state to Unloaded
+        {
+            let mut state_guard = self
+                .loading_state
+                .write()
+                .map_err(|_| Status::internal("Failed to lock loading state"))?;
+            *state_guard = LoadingState::Unloaded;
+        }
+
+        Ok(Response::new(UnloadHashesResponse {
             success: true,
-            message: "unload_hashes - placeholder".to_string(),
-        };
-        Ok(Response::new(response))
+            message: "Hashtables unloaded successfully".to_string(),
+        }))
     }
 
     async fn add_hash(
@@ -127,16 +182,51 @@ impl HashLoader for ServiceHashLoader {
     ) -> Result<Response<AddHashResponse>, Status> {
         let req = request.into_inner();
         println!(
-            "add_hash called for hash: {}, value: {}, type: {}",
-            req.hash, req.value, req.hashtable_type
+            "add_hash called for , value: {}, type: {}",
+            req.string, req.hashtable_type
         );
 
-        // Placeholder implementation
-        let response = AddHashResponse {
-            success: true,
-            message: "add_hash - placeholder".to_string(),
+        self.ensure_loaded_status().await?;
+
+        // if game xxhash64 if bin fnv1a
+        let hash = match req.hashtable_type.as_str() {
+            "game" => xxh64(req.string.to_lowercase().as_bytes(), 0),
+            "bin" => {
+                // Correct FNV-1a 32-bit implementation (standard offset basis)
+                // 32-bit offset basis: 0x811C9DC5, prime: 0x01000193
+                let mut hash: u32 = 0x811C9DC5;
+                for &byte in req.string.to_lowercase().as_bytes() {
+                    hash ^= byte as u32;
+                    hash = hash.wrapping_mul(0x01000193);
+                }
+                // return as u64 with value in lower 32 bits (matches client 32-bit hex -> decimal)
+                hash as u64
+            }
+            _ => {
+                return Ok(Response::new(AddHashResponse {
+                    success: false,
+                    message: "Invalid hashtable type".to_string(),
+                }));
+            }
         };
-        Ok(Response::new(response))
+        println!("Computed hash: {}", hash);
+
+        // Insert into appropriate hashtable
+        let hashtable = match req.hashtable_type.as_str() {
+            "game" => &self.game_hashes,
+            "bin" => &self.bin_hashes,
+            _ => unreachable!(),
+        };
+        let mut guard = hashtable
+            .write()
+            .map_err(|_| Status::internal("Failed to lock hashtable for writing"))?;
+
+        guard.insert(hash, req.string);
+
+        Ok(Response::new(AddHashResponse {
+            success: true,
+            message: "Added hash successfully".to_string(),
+        }))
     }
 }
 
@@ -145,25 +235,109 @@ impl ServiceHashLoader {
         ServiceHashLoader {
             game_hashes: Arc::new(RwLock::new(HashMap::default())),
             bin_hashes: Arc::new(RwLock::new(HashMap::default())),
+            loading_state: Arc::new(RwLock::new(LoadingState::Unloaded)),
         }
     }
 
-    async fn load_hashes_impl(&self) -> Result<(), String> {
-        let project_dirs = ProjectDirs::from("com", "league-toolkit", "lol-hashes");
+    async fn ensure_loaded_status(&self) -> Result<(), Status> {
+        self.ensure_loaded()
+            .await
+            .map_err(|e| Status::internal(format!("Failed to load hashtables: {}", e)))
+    }
 
-        let project_dirs =
-            project_dirs.ok_or_else(|| "Failed to get project directories".to_string())?;
-        let cache_dir = project_dirs.cache_dir();
-        create_project_dirs(&project_dirs);
+    async fn ensure_loaded(&self) -> Result<(), String> {
+        // Check current state and transition if needed
+        let should_load = {
+            let mut state_guard = self
+                .loading_state
+                .write()
+                .map_err(|_| "Failed to lock loading state".to_string())?;
+
+            match *state_guard {
+                LoadingState::Loaded => {
+                    // Already loaded, nothing to do
+                    return Ok(());
+                }
+                LoadingState::Loading => {
+                    // Already loading, return error
+                    return Err("Hashtables are currently being loaded".to_string());
+                }
+                LoadingState::Unloaded => {
+                    // Transition to Loading
+                    *state_guard = LoadingState::Loading;
+                    true
+                }
+            }
+        };
+
+        if should_load {
+            println!("Hashtables are unloaded, loading them now...");
+
+            // Load the hashtables
+            let result = self.load_hashes_impl().await;
+
+            // Update state based on result
+            let mut state_guard = self
+                .loading_state
+                .write()
+                .map_err(|_| "Failed to lock loading state".to_string())?;
+
+            *state_guard = if result.is_ok() {
+                LoadingState::Loaded
+            } else {
+                LoadingState::Unloaded // Reset to Unloaded on error
+            };
+
+            result?;
+        }
+
+        Ok(())
+    }
+
+    fn get_hashtable(&self, hashtable_type: &HashtableType) -> &Arc<RwLock<HashMap<u64, String>>> {
+        match hashtable_type {
+            HashtableType::Game => &self.game_hashes,
+            HashtableType::Bin => &self.bin_hashes,
+        }
+    }
+
+    fn get_counts(&self) -> Result<(usize, usize), Status> {
+        let game_guard = self
+            .game_hashes
+            .read()
+            .map_err(|_| Status::internal("Failed to lock game hashtable"))?;
+        let bin_guard = self
+            .bin_hashes
+            .read()
+            .map_err(|_| Status::internal("Failed to lock bin hashtable"))?;
+        Ok((game_guard.len(), bin_guard.len()))
+    }
+
+    async fn load_hashes_impl(&self) -> Result<(), String> {
+        let project_dirs = ProjectDirs::from("io", "LeagueToolkit", "ltk-hash-cache")
+            .ok_or_else(|| "Failed to get project directories".to_string())?;
+
+        let hash_dir: PathBuf = if cfg!(target_os = "linux") {
+            project_dirs.cache_dir().to_path_buf()
+        } else {
+            directories_next::UserDirs::new()
+                .and_then(|ud| {
+                    ud.document_dir()
+                        .map(|p| p.join("LeagueToolkit").join("ltk-hash-cache").to_path_buf())
+                })
+                .unwrap_or_else(|| project_dirs.cache_dir().to_path_buf())
+        };
+        std::fs::create_dir_all(&hash_dir)
+            .map_err(|e| format!("Failed to create cache directory: {}", e))?;
 
         // Sync hashtables from GitHub
-        let cache_dir_str = cache_dir
+        let cache_dir_str = hash_dir
             .to_str()
             .ok_or_else(|| "Invalid cache directory path".to_string())?;
         sync_hashtables(cache_dir_str).await?;
 
         // Load hashtables from directory
-        self.add_from_dir(cache_dir)?;
+        self.add_from_dir(hash_dir)?;
 
         Ok(())
     }
@@ -207,7 +381,7 @@ impl ServiceHashLoader {
 
         let mut guard = hashtable
             .write()
-            .map_err(|_| "Failed to lock hashtable".to_string())?;
+            .map_err(|_| "Failed to lock hashtable for writing".to_string())?;
 
         while let Some(Ok(line)) = lines.next() {
             let mut components = line.split(' ');
@@ -228,16 +402,17 @@ impl ServiceHashLoader {
     }
 }
 
-fn create_project_dirs(project_dirs: &ProjectDirs) {
-    let cache_dir = project_dirs.cache_dir();
-    // check if directory exists
-    if !cache_dir.exists() {
-        // create directory
-        if let Err(e) = std::fs::create_dir_all(cache_dir) {
-            eprintln!("Failed to create cache directory: {:?}", e);
-        }
-    }
-}
+// fn create_project_dirs(project_dirs: &ProjectDirs) {
+
+//     let cache_dir = project_dirs.cache_dir();
+//     // check if directory exists
+//     if !cache_dir.exists() {
+//         // create directory
+//         if let Err(e) = std::fs::create_dir_all(cache_dir) {
+//             eprintln!("Failed to create cache directory: {:?}", e);
+//         }
+//     }
+// }
 
 async fn sync_hashtables(appdatadir: &str) -> Result<(), String> {
     let git_links: Vec<&str> = vec![
@@ -297,13 +472,7 @@ async fn sync_hashtables(appdatadir: &str) -> Result<(), String> {
 }
 
 async fn get_git_data(url: &str) -> Result<Value, String> {
-    let client = reqwest::Client::new();
-    let response = client
-        .get(url)
-        .header("User-Agent", "Rust-Client")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let response = http_get(url).await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -314,23 +483,28 @@ async fn get_git_data(url: &str) -> Result<Value, String> {
         ));
     }
 
-    let v: Value = response.json().await.map_err(|e| e.to_string())?;
-    Ok(v)
+    response.json().await.map_err(|e| e.to_string())
 }
 
 async fn download_file(url: &str) -> Result<Vec<u8>, String> {
-    let client = reqwest::Client::new();
-    let response = client
-        .get(url)
-        .header("User-Agent", "Rust-Client")
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let response = http_get(url).await?;
 
     if !response.status().is_success() {
         return Err(format!("Failed to download file: {}", response.status()));
     }
 
-    let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    Ok(bytes.to_vec())
+    response
+        .bytes()
+        .await
+        .map_err(|e| e.to_string())
+        .map(|b| b.to_vec())
+}
+
+async fn http_get(url: &str) -> Result<reqwest::Response, String> {
+    reqwest::Client::new()
+        .get(url)
+        .header("User-Agent", "Rust-Client")
+        .send()
+        .await
+        .map_err(|e| e.to_string())
 }

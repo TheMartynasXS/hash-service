@@ -6,9 +6,7 @@ use tray_icon::{
 use winit::application::ApplicationHandler;
 
 use crate::hash_service::hash_loader_client::HashLoaderClient;
-use crate::hash_service::{
-    LoadHashesRequest, LoadHashesResponse, UnloadHashesRequest, UnloadHashesResponse,
-};
+use crate::hash_service::{LoadHashesRequest, UnloadHashesRequest};
 
 #[derive(Debug)]
 pub enum UserEvent {

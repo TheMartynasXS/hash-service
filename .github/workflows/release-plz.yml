@@ -1,0 +1,179 @@
+name: Release-plz PR
+
+on:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+jobs:
+  release-plz-pr:
+    name: Release-plz PR
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'TheMartynasXS' }}
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-plz-release:
+    name: Release-plz Release
+    runs-on: ubuntu-latest
+    if: ${{ github.repository_owner == 'TheMartynasXS' && contains(github.event.head_commit.message, 'chore(release)') }}
+    permissions:
+      contents: write
+      pull-requests: read
+    concurrency:
+      group: release-plz-release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz (tag)
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  create-release:
+    name: Create Release
+    needs: release-plz-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      upload_url: ${{ steps.get_or_create_release.outputs.upload_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compute tag from Cargo.toml
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(awk -F '"' '/^version[[:space:]]*=/ {print $2; exit}' Cargo.toml)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+      - name: Extract latest changelog section for this tag
+        id: changelog
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          FILE="CHANGELOG.md"
+          OUT="CHANGELOG_LATEST.md"
+          if [[ ! -f "$FILE" ]]; then
+            echo "Changelog not found. Creating empty body." > "$OUT"
+          else
+            awk -v tag="$TAG" '
+              BEGIN {found=0}
+              /^##[[:space:]]/ {
+                if (found) { exit }
+              }
+              $0 ~ "^##[[:space:]].*" tag "$" || $0 ~ "^##[[:space:]].*\\[" tag "\\]" {
+                found=1
+                next
+              }
+              found { print }
+            ' "$FILE" > "$OUT" || true
+            if ! grep -q '[^[:space:]]' "$OUT"; then
+              awk '
+                BEGIN {start=0}
+                /^##[[:space:]]/ { if (start) { exit } else { start=1; next } }
+                start { print }
+              ' "$FILE" > "$OUT" || true
+            fi
+            if ! grep -q '[^[:space:]]' "$OUT"; then
+              echo "No changelog entries found for $TAG." > "$OUT"
+            fi
+          fi
+          echo "Changelog extracted to $OUT"
+      - name: Get or Create Release
+        id: get_or_create_release
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const tag = process.env.TAG;
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+            } catch (e) {
+              if (e.status !== 404) throw e;
+            }
+            if (!release) {
+              const body = fs.existsSync('CHANGELOG_LATEST.md') ? fs.readFileSync('CHANGELOG_LATEST.md', 'utf8') : '';
+              release = await github.rest.repos.createRelease({
+                owner,
+                repo,
+                tag_name: tag,
+                name: `Release ${tag}`,
+                body,
+                draft: false,
+                prerelease: false,
+              });
+            }
+            core.setOutput('upload_url', release.data.upload_url);
+
+  build-and-upload:
+    name: Build and Upload
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: ltk-tex-utils.exe
+            asset_name: ltk-tex-utils-windows.exe
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt,clippy
+      - name: Build Release Binary
+        run: cargo build --verbose --release --target ${{ matrix.target }}
+      - name: Build Windows Thumbnail Handler DLL
+        if: matrix.os == 'windows-latest'
+        run: cargo build --verbose --release --target ${{ matrix.target }} -p ltk-hash-service
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+          asset_name: ${{ matrix.asset_name }}
+          asset_content_type: application/octet-stream
