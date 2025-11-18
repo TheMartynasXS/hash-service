@@ -330,13 +330,41 @@ impl ServiceHashLoader {
         std::fs::create_dir_all(&hash_dir)
             .map_err(|e| format!("Failed to create cache directory: {}", e))?;
 
-        // Sync hashtables from GitHub
+        // Sync hashtables from GitHub, but if sync fails try to load local files instead.
         let cache_dir_str = hash_dir
             .to_str()
             .ok_or_else(|| "Invalid cache directory path".to_string())?;
-        sync_hashtables(cache_dir_str).await?;
 
-        // Load hashtables from directory
+        if let Err(sync_err) = sync_hashtables(cache_dir_str).await {
+            eprintln!(
+                "Warning: failed to sync hashtables from GitHub: {}. Will try to load local files if present.",
+                sync_err
+            );
+
+            // Check for any existing hashtable files that we can load
+            let mut found_local = false;
+            for entry in WalkDir::new(&hash_dir).into_iter().filter_map(|x| x.ok()) {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy();
+                if name.contains(".game.") || name.contains(".binentries.") {
+                    found_local = true;
+                    break;
+                }
+            }
+
+            if !found_local {
+                return Err(format!(
+                    "Failed to sync hashtables from GitHub: {} and no local hashtable files were found in {:?}",
+                    sync_err, hash_dir
+                ));
+            } else {
+                println!("Local hashtable files found, loading from disk.");
+            }
+        }
+
+        // Load hashtables from directory (either after successful sync or fallback)
         self.add_from_dir(hash_dir)?;
 
         Ok(())
@@ -401,18 +429,6 @@ impl ServiceHashLoader {
         Ok(())
     }
 }
-
-// fn create_project_dirs(project_dirs: &ProjectDirs) {
-
-//     let cache_dir = project_dirs.cache_dir();
-//     // check if directory exists
-//     if !cache_dir.exists() {
-//         // create directory
-//         if let Err(e) = std::fs::create_dir_all(cache_dir) {
-//             eprintln!("Failed to create cache directory: {:?}", e);
-//         }
-//     }
-// }
 
 async fn sync_hashtables(appdatadir: &str) -> Result<(), String> {
     let git_links: Vec<&str> = vec![
